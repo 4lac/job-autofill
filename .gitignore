@@ -1,0 +1,7 @@
+profile.json
+my_files/
+scan_reports/
+.browser_profile*/
+.venv/
+*.pdf
+__pycache__/
