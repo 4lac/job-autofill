@@ -5,3 +5,5 @@ scan_reports/
 .venv/
 *.pdf
 __pycache__/
+*.enc
+.key
