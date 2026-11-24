@@ -24,5 +24,14 @@ if errorlevel 1 (
   )
   python -m playwright install chromium
 )
+if not exist "%APPDATA%\job-autofill\.shortcut_asked" (
+  if not exist "%APPDATA%\job-autofill" mkdir "%APPDATA%\job-autofill"
+  echo asked> "%APPDATA%\job-autofill\.shortcut_asked"
+  choice /c YN /m "Create a desktop shortcut with the app icon"
+  if not errorlevel 2 (
+    powershell -NoProfile -Command "$s=(New-Object -ComObject WScript.Shell).CreateShortcut([Environment]::GetFolderPath('Desktop')+'\Job Autofill.lnk');$s.TargetPath='%~dp0start.bat';$s.WorkingDirectory='%~dp0';$s.IconLocation='%~dp0icon.ico';$s.Save()"
+    echo Shortcut created on your Desktop.
+  )
+)
 python job_autofill.py
 pause
