@@ -13,7 +13,9 @@ import atexit
 import getpass
 import hashlib
 import importlib.util
+import io
 import json
+import mimetypes
 import os
 import re
 import shutil
@@ -26,7 +28,7 @@ import webbrowser
 from pathlib import Path
 from urllib.parse import urlparse
 
-from flask import Flask, abort, jsonify, request, send_from_directory
+from flask import Flask, abort, jsonify, request, send_file
 
 BASE = Path(__file__).resolve().parent
 
@@ -50,10 +52,14 @@ SESSION_DIR = DATA_DIR / ".browser_profile"
 CHROME_SESSION_DIR = DATA_DIR / ".browser_profile_chrome"
 SCAN_DIR = DATA_DIR / "scan_reports"
 FILES = DATA_DIR / "my_files"
-PROFILE = DATA_DIR / "profile.json"
+PROFILE = DATA_DIR / "profile.enc"          # encrypted
+PLAIN_PROFILE = DATA_DIR / "profile.json"  # only exists before the first encryption
 EXAMPLE = BASE / "profile.example.json"
 DEVICE_MARK = DATA_DIR / ".device"
-PERSONAL = [PROFILE, FILES, SESSION_DIR, CHROME_SESSION_DIR, SCAN_DIR]
+KEY_FILE = DATA_DIR / ".key"  # only used when the system key store is not available
+ENC = ".enc"
+KEY_SERVICE = "job-autofill"
+PERSONAL = [PROFILE, PLAIN_PROFILE, KEY_FILE, FILES, SESSION_DIR, CHROME_SESSION_DIR, SCAN_DIR]
 LEGACY = [BASE / "profile.json", BASE / "my_files", BASE / ".browser_profile",
           BASE / ".browser_profile_chrome", BASE / "scan_reports"]  # where old versions kept your data
 PORT = 5055
@@ -63,6 +69,128 @@ KINDS = {"cv": "cv", "photo": "photo", "id_copy": "id_copy", "national_address":
 EXTS = {".pdf", ".png", ".jpg", ".jpeg", ".webp"}
 # On Windows, keep the browser sandbox ON (removes the "--no-sandbox" warning banner)
 SANDBOX = sys.platform == "win32"
+
+
+# ======================================================================
+#  Encryption: your profile and uploaded files are stored encrypted
+# ======================================================================
+class KeyLost(Exception):
+    """Encrypted data exists but its key is gone (e.g. Windows reinstalled)."""
+
+
+_KEY = {"v": None, "mode": None}
+
+
+def _keyring():
+    try:
+        import keyring
+        kr = keyring.get_keyring()
+        if getattr(kr, "priority", 1) <= 0:  # the "fail" backend: no real key store on this system
+            return None
+        return keyring
+    except Exception:
+        return None
+
+
+def _has_encrypted():
+    return PROFILE.exists() or (FILES.exists() and any(FILES.rglob("*" + ENC)))
+
+
+def get_key():
+    if _KEY["v"]:
+        return _KEY["v"]
+    kr = _keyring()
+    key = None
+    if kr:
+        try:
+            key = kr.get_password(KEY_SERVICE, "data-key")
+        except Exception:
+            kr, key = None, None
+        if key:
+            _KEY.update(v=key.encode(), mode="keyring")
+            return _KEY["v"]
+    if KEY_FILE.exists():
+        _KEY.update(v=KEY_FILE.read_text().strip().encode(), mode="file")
+        return _KEY["v"]
+    if _has_encrypted():
+        raise KeyLost()
+    from cryptography.fernet import Fernet
+    new = Fernet.generate_key()
+    if kr:
+        try:
+            kr.set_password(KEY_SERVICE, "data-key", new.decode())
+            _KEY.update(v=new, mode="keyring")
+            return new
+        except Exception:
+            pass
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    KEY_FILE.write_text(new.decode())
+    try:
+        os.chmod(KEY_FILE, 0o600)
+    except Exception:
+        pass
+    _KEY.update(v=new, mode="file")
+    return new
+
+
+def enc_bytes(b):
+    from cryptography.fernet import Fernet
+    return Fernet(get_key()).encrypt(b)
+
+
+def dec_bytes(b):
+    from cryptography.fernet import Fernet
+    return Fernet(get_key()).decrypt(b)
+
+
+def read_profile_file(path):
+    """Reads a profile: encrypted (profile.enc) or a plain .json (for people who bring their own file)."""
+    raw = Path(path).read_bytes()
+    if raw[:6] == b"gAAAAA":  # every encrypted token starts like this
+        raw = dec_bytes(raw)
+    return json.loads(raw.decode("utf-8"))
+
+
+def write_profile(data):
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    PROFILE.write_bytes(enc_bytes(json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")))
+
+
+def phys(path):
+    """Uploaded files are stored as <name>.enc; this is that location for a logical path."""
+    return Path(str(path) + ENC)
+
+
+def read_stored_file(path):
+    p = phys(path)
+    if p.is_file():
+        return dec_bytes(p.read_bytes())
+    if Path(path).is_file():  # an old unencrypted file, until the next start migrates it
+        return Path(path).read_bytes()
+    return None
+
+
+def encrypt_plaintext():
+    """Encrypt anything stored in the clear by an older version. Returns how many items changed."""
+    n = 0
+    if PLAIN_PROFILE.exists():
+        try:
+            data = json.loads(PLAIN_PROFILE.read_text(encoding="utf-8"))
+        except Exception:
+            data = None
+        if data is not None and (not PROFILE.exists() or PLAIN_PROFILE.stat().st_mtime > PROFILE.stat().st_mtime):
+            write_profile(data)
+        if PROFILE.exists():
+            PLAIN_PROFILE.unlink()
+            n += 1
+    if FILES.exists():
+        for f in list(FILES.rglob("*")):
+            if f.is_file() and f.suffix != ENC:
+                phys(f).write_bytes(enc_bytes(f.read_bytes()))
+                f.unlink()
+                n += 1
+    return n
+
 
 # ======================================================================
 #  The web page (UI)
@@ -283,6 +411,8 @@ async function legacyDo(a){try{await post("/api/legacy",{action:a});P=await api(
 async function startup(){
  try{const i=await api("/api/info");$("#ddir").textContent=i.data_dir;let h="";
   if(i.wiped)h+='<div class="note">⚠️ هذي الأداة اشتغلت على جهاز أو حساب مختلف، فنُظّفت أي بيانات قديمة كانت معها. عبّ بياناتك من جديد.</div>';
+  if(i.key_lost)h+='<div class="note">⚠️ بياناتك مشفّرة لكن مفتاحها ضاع (غالباً بعد إعادة تثبيت النظام)، فما أقدر أفتحها. اضغط «حذف كل بياناتي» أسفل الصفحة وابدأ من جديد.</div>';
+  else if(i.key_mode==="file")h+='<div class="note">🔑 نظامك ما فيه خزنة مفاتيح، فمفتاح التشفير محفوظ في ملف جنب بياناتك (حماية أضعف). الأفضل تفعّل خزنة النظام (مثل GNOME Keyring) وتعيد التشغيل.</div>';
   if(i.legacy)h+='<div class="note">وجدت بيانات داخل مجلد الأداة نفسه (نسخة قديمة). هل هي بياناتك أنت؟<br><button class="btn small main" onclick="legacyDo(\'migrate\')">نعم، انقلها لمكان آمن</button> <button class="btn small danger" onclick="legacyDo(\'delete\')">لا، احذفها</button></div>';
   $("#alerts").innerHTML=h}catch(e){}}
 (async()=>{try{P=await api("/api/profile")}catch(e){toast(e.message)}render();startup()})();
@@ -680,11 +810,17 @@ def fill_page(page, profile, overwrite=False, dry_run=False):
                     if FILES.resolve() not in path.parents:
                         missed.append(f"{shown}  [file must be inside the my_files folder]")
                         continue
-                    if not path.exists():
-                        missed.append(f"{shown}  [file not found: {path}]")
+                    try:
+                        blob = read_stored_file(path)
+                    except Exception:
+                        missed.append(f"{shown}  [could not decrypt the file]")
                         continue
-                    if not dry_run:
-                        el.set_input_files(str(path))
+                    if blob is None:
+                        missed.append(f"{shown}  [file not found: {path.name}]")
+                        continue
+                    if not dry_run:  # sent straight from memory: a readable copy is never written to disk
+                        el.set_input_files({"name": path.name, "buffer": blob,
+                                            "mimeType": mimetypes.guess_type(path.name)[0] or "application/octet-stream"})
                 elif d["tag"] == "select":
                     if d["value"] and not overwrite:
                         continue
@@ -876,7 +1012,7 @@ def browser_alive(ctx):
 
 
 def load_profile(pf):
-    profile = json.loads(Path(pf).read_text(encoding="utf-8"))
+    profile = read_profile_file(pf)
     certs = [c for c in profile.get("certificates", []) if isinstance(c, dict) and c.get("path")]
     if certs:
         if not profile.get("certificate_path"):
@@ -1033,14 +1169,26 @@ def index():
 
 @app.get("/files/<path:name>")
 def files(name):
-    return send_from_directory(FILES, name)
+    p = (FILES / name).resolve()
+    if FILES.resolve() not in p.parents:
+        abort(404)
+    try:
+        blob = read_stored_file(p)
+    except Exception:
+        abort(404)
+    if blob is None:
+        abort(404)
+    return send_file(io.BytesIO(blob), mimetype=mimetypes.guess_type(p.name)[0] or "application/octet-stream",
+                     max_age=0)
 
 
 @app.get("/api/profile")
 def get_profile():
-    src = PROFILE if PROFILE.exists() else EXAMPLE
+    src = PROFILE if PROFILE.exists() else (PLAIN_PROFILE if PLAIN_PROFILE.exists() else EXAMPLE)
     try:
-        data = json.loads(src.read_text(encoding="utf-8"))
+        data = read_profile_file(src)
+    except KeyLost:
+        return err("ما أقدر أفتح بياناتك المشفّرة لأن مفتاحها ضاع (مثلاً بعد إعادة تثبيت ويندوز). اضغط «حذف كل بياناتي» وابدأ من جديد.")
     except Exception as e:
         return err(f"ملف البيانات فيه خطأ: {e}")
     data.setdefault("certificates", [])
@@ -1052,8 +1200,14 @@ def save_profile():
     data = request.get_json(silent=True)
     if not isinstance(data, dict):
         return err("بيانات غير صالحة")
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    PROFILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    try:
+        write_profile(data)
+    except KeyLost:
+        return err("مفتاح التشفير ضاع. اضغط «حذف كل بياناتي» وابدأ من جديد.")
+    except Exception as e:
+        return err(f"ما قدرت أحفظ: {e}")
+    if PLAIN_PROFILE.exists():
+        PLAIN_PROFILE.unlink()
     return jsonify(ok=True)
 
 
@@ -1078,7 +1232,7 @@ def upload():
         d.mkdir(parents=True, exist_ok=True)
         stem = slug(request.form.get("name") or Path(f.filename).stem)
         target, n = d / f"{stem}{ext}", 2
-        while target.exists():
+        while phys(target).exists():
             target, n = d / f"{stem}_{n}{ext}", n + 1
     elif kind in KINDS:
         for old in FILES.glob(KINDS[kind] + ".*"):
@@ -1086,7 +1240,12 @@ def upload():
         target = FILES / (KINDS[kind] + ext)
     else:
         return err("نوع غير معروف")
-    f.save(target)
+    try:
+        phys(target).write_bytes(enc_bytes(f.read()))
+    except KeyLost:
+        return err("مفتاح التشفير ضاع. اضغط «حذف كل بياناتي» وابدأ من جديد.")
+    except Exception as e:
+        return err(f"ما قدرت أحفظ الملف: {e}")
     return jsonify(path=target.relative_to(DATA_DIR).as_posix())
 
 
@@ -1094,8 +1253,10 @@ def upload():
 def delete_file():
     rel = (request.get_json(silent=True) or {}).get("path", "")
     p = (DATA_DIR / rel).resolve()
-    if FILES.resolve() in p.parents and p.is_file():
-        p.unlink()
+    if FILES.resolve() in p.parents:
+        for q in (p, phys(p)):
+            if q.is_file():
+                q.unlink()
     return jsonify(ok=True)
 
 
@@ -1208,7 +1369,7 @@ def _refresh_redactor():
     pats = set()
     if mt is not None:
         try:
-            data = json.loads(PROFILE.read_text(encoding="utf-8"))
+            data = read_profile_file(PROFILE)
         except Exception:
             data = {}
         for key, val in _flatten(data):
@@ -1297,7 +1458,7 @@ def af_start():
                 RUN["proc"].terminate()
             except Exception:
                 pass
-    if not PROFILE.exists():
+    if not (PROFILE.exists() or PLAIN_PROFILE.exists()):
         return err("احفظ بياناتك أول، بعدين شغّل التعبئة")
     if importlib.util.find_spec("playwright") is None:
         return err("مكتبة playwright غير مثبتة. شغّل start.bat (أو start.sh) بدل التشغيل المباشر")
@@ -1320,7 +1481,15 @@ def af_start():
 
 @app.get("/api/info")
 def info():
-    return jsonify(data_dir=str(DATA_DIR), wiped=STATE["wiped"], legacy=any(x.exists() for x in LEGACY))
+    key_lost = False
+    try:
+        get_key()
+    except KeyLost:
+        key_lost = True
+    except Exception:
+        pass
+    return jsonify(data_dir=str(DATA_DIR), wiped=STATE["wiped"], legacy=any(x.exists() for x in LEGACY),
+                   key_mode=_KEY["mode"], key_lost=key_lost)
 
 
 @app.post("/api/legacy")
@@ -1335,6 +1504,10 @@ def legacy():
     for old, new in zip(LEGACY, PERSONAL):
         if old.exists() and not new.exists():
             shutil.move(str(old), str(new))
+    try:
+        encrypt_plaintext()
+    except Exception:
+        pass
     for old in LEGACY:  # anything left (the new location already had it): remove the copy inside the tool folder
         if old.is_dir():
             shutil.rmtree(old, ignore_errors=True)
@@ -1441,6 +1614,10 @@ if __name__ == "__main__":
         worker_main(sys.argv[2:])
     else:
         STATE["wiped"] = check_device()
+        try:
+            encrypt_plaintext()
+        except Exception:
+            pass
         url = f"http://127.0.0.1:{PORT}"
         print(f"\njob-autofill by Reyof (@4lavc)\nافتح المتصفح على: {url}\nللإيقاف: اضغط Ctrl+C في هذه النافذة\n")
         threading.Timer(1.0, lambda: webbrowser.open(url)).start()

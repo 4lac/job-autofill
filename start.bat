@@ -13,7 +13,7 @@ if not exist .venv\Scripts\activate.bat (
   %PY% -m venv .venv
 )
 call .venv\Scripts\activate.bat
-python -c "import flask, playwright" >nul 2>nul
+python -c "import flask, playwright, keyring, cryptography" >nul 2>nul
 if errorlevel 1 (
   echo Installing requirements...
   python -m pip install -r requirements.txt flask playwright

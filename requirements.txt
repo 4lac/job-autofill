@@ -1,2 +1,4 @@
 playwright
 flask
+keyring
+cryptography
